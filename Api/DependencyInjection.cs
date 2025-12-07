@@ -64,11 +64,11 @@ internal static class DependencyInjection
             .ValidateOnStart()
             .ValidateDataAnnotations();
 
-        //services
-        //    .AddOptions<EmailConfiguration>()
-        //    .BindConfiguration(EmailConfiguration.SectionName)
-        //    .ValidateOnStart()
-        //    .ValidateDataAnnotations();
+        services
+            .AddOptions<EmailConfiguration>()
+            .BindConfiguration(EmailConfiguration.SectionName)
+            .ValidateOnStart()
+            .ValidateDataAnnotations();
 
         services
             .AddOptions<IdentityApiConfiguration>()
