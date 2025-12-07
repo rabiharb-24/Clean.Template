@@ -1,0 +1,146 @@
+﻿using Application.Common.Interfaces;
+using Domain.Entities.Identity;
+using Microsoft.AspNetCore.Identity;
+using Serilog;
+
+namespace Application.Features.Identity.Commands;
+
+public sealed record UpdateUserCommand(UpdateUserDto Info) : IRequest<Result>;
+
+public class UpdateUserCommandHandler : IRequestHandler<UpdateUserCommand, Result>
+{
+    private readonly IMapper mapper;
+    private readonly IUnitOfWork unitOfWork;
+
+    public UpdateUserCommandHandler(
+        IMapper mapper,
+        IUnitOfWork unitOfWork)
+    {
+        this.mapper = mapper;
+        this.unitOfWork = unitOfWork;
+    }
+
+    public async Task<Result> Handle(UpdateUserCommand request, CancellationToken cancellationToken)
+    {
+        ApplicationUser oldUser = await unitOfWork.IdentityRepository.GetUserAsync(request.Info.ApplicationUserDto.Id, cancellationToken);
+        if (oldUser.Id == default)
+        {
+            throw new InvalidOperationException(Constants.Errors.UserNotFound);
+        }
+
+        (bool success, string? error) = await ValidateUser(request.Info.ApplicationUserDto.Username, request.Info.ApplicationUserDto.Email, request.Info.ApplicationUserDto.Id, cancellationToken);
+        if (!success)
+        {
+            return Result<string>.CreateFailure(error is not null ? [error] : []);
+        }
+
+        ApplicationUser updatedUser = mapper.Map<ApplicationUser>(request.Info.ApplicationUserDto);
+
+        oldUser = ManipulateData(oldUser, updatedUser);
+
+        try
+        {
+            await unitOfWork.BeginTransactionAsync(cancellationToken);
+
+            IdentityResult result = await unitOfWork.IdentityRepository.UpdateUserAsync(oldUser, cancellationToken);
+            if (!result.Succeeded)
+            {
+                throw new Exception(result.Errors?.FirstOrDefault()?.Description);
+            }
+
+            await HandleRoleAssignment(oldUser.Id, request.Info.ApplicationUserDto.RoleName, request.Info.ApplicationUserDto.Permissions, cancellationToken);
+
+            await unitOfWork.SaveChangesAsync(cancellationToken);
+
+            await unitOfWork.CommitTransactionAsync(cancellationToken);
+
+            return Result.CreateSuccess();
+        }
+        catch (Exception ex)
+        {
+            Log.Error(ex, ex.Message);
+
+            await unitOfWork.RollbackTransactionAsync(cancellationToken);
+
+            return Result.CreateFailure([ex.Message]);
+        }
+    }
+
+    #region Private Methods
+
+    private static ApplicationUser ManipulateData(ApplicationUser oldUser, ApplicationUser updatedUser)
+    {
+        string oldEmail = oldUser.Email;
+        string newEmail = updatedUser.Email;
+
+        oldUser.UserName = updatedUser.UserName;
+        oldUser.FirstName = updatedUser.FirstName;
+        oldUser.MiddleName = updatedUser.MiddleName;
+        oldUser.LastName = updatedUser.LastName;
+        oldUser.PhoneNumber = updatedUser.PhoneNumber;
+        oldUser.Active = updatedUser.Active;
+
+        if (oldEmail != newEmail)
+        {
+            // Save last confirmed email
+            oldUser.OldConfirmedEmail = oldUser.EmailConfirmed ? oldEmail : oldUser.OldConfirmedEmail;
+
+            // If reverted to old email
+            oldUser.EmailConfirmed = newEmail == oldUser.OldConfirmedEmail;
+
+            oldUser.Email = newEmail;
+        }
+
+        return oldUser;
+    }
+
+    private async Task<(bool success, string? error)> ValidateUser(string username, string email, int updatedUserId, CancellationToken cancellationToken)
+    {
+        ApplicationUser existingUser = await unitOfWork.IdentityRepository.FindByNameAsync(username, cancellationToken);
+        if (existingUser.Id == default)
+        {
+            existingUser = await unitOfWork.IdentityRepository.FindByEmailAsync(email, cancellationToken);
+        }
+
+        if (existingUser.Id != default && existingUser.Id != updatedUserId)
+        {
+            return (false, Constants.Errors.UserAlreadyExists);
+        }
+
+        existingUser = await unitOfWork.IdentityRepository.FindByEmailAsync(username, cancellationToken);
+        if (existingUser.Id != default && existingUser.Id != updatedUserId)
+        {
+            return (false, Constants.Errors.UsernameMustBeDifferentThanEmail);
+        }
+
+        return (true, null);
+    }
+
+    private async Task HandleRoleAssignment(int userId, string roleName, IEnumerable<PermissionDto> permissions, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrEmpty(roleName))
+        {
+            return;
+        }
+
+        // Remove old role
+        IdentityResult result = await unitOfWork.IdentityRepository.RemoveUserRolesAsync(userId, cancellationToken);
+        if (!result.Succeeded)
+        {
+            throw new Exception(Constants.Errors.CannotRemoveOldRoles);
+        }
+
+        result = await unitOfWork.IdentityRepository.RemoveUserClaimsAsync(userId, cancellationToken);
+        if (!result.Succeeded)
+        {
+            throw new Exception("CannotRemoveOldPermssions");
+        }
+
+        // Assign new roles
+        if (!result.Succeeded)
+        {
+            throw new Exception(result.Errors?.FirstOrDefault()?.Description);
+        }
+    }
+    #endregion
+}
